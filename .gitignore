@@ -1,0 +1,19 @@
+# Ignore data, checkpoints, outputs, etc.
+*.pt
+*.pth
+*.ckpt
+*.log
+*.csv
+*.json
+*.mp4
+*.jpg
+*.png
+
+# Ignore folders
+data/
+checkpoints/
+outputs/
+logs/
+
+# Ignore any hidden system files
+.DS_Store
