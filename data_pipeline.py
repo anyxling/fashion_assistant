@@ -202,7 +202,7 @@ class OutfitGenerator:
         # Initialize OpenRouter client
         client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
-            api_key="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",
+            api_key="",
         )
         # Ask user for input
         city = input("which city are you currently in?")
@@ -210,7 +210,7 @@ class OutfitGenerator:
         sex = input("what's your gender")
 
         # Get temperature
-        API_KEY = "0db13be3f5563366aed5781b81d39c7f"
+        API_KEY = ""
         url = f'https://api.openweathermap.org/data/2.5/weather?q={city}&appid={API_KEY}&units=imperial'
         response_weather = requests.get(url)
         data = response.json()
