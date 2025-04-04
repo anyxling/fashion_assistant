@@ -11,6 +11,9 @@ import random
 from torch.utils.data import Dataset, DataLoader
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
+from openai import OpenAI
+from sklearn.neighbors import NearestNeighbors
+import requests
 
 def get_valid_items(all_sets):
     # Filter and collect valid (image_path, description) pairs
@@ -116,3 +119,161 @@ def create_compatibility_data(all_sets, item_ids):
     random.shuffle(all_outfits)
 
     return all_outfits
+
+
+# def init_category_map(category_id):
+#     category_map = {}
+#     for cat in category_id:
+#         cat = cat.strip()
+#         num, text = cat.split(" ", 1)
+#         category_map[int(num)] = {"description": text}, {"train": []}, {"val": []}, {"test": []}
+#     return category_map
+
+
+def map_category_items(data, dataname, category_map, item_ids):
+    if dataname == "train":
+        idx = 1
+    elif dataname == "val":
+        idx = 2
+    else:
+        idx = 3
+    for outfit in data:
+        set_id = outfit.get("set_id")
+        for item in outfit.get("items", []):
+            name = item.get("name", "").strip().lower()
+            if not name or name == 'polyvore':
+                continue
+            index = item["index"]
+            item_id = f"{set_id}_{index}"
+            categoryid = item.get("categoryid") 
+            if item_id in item_ids:
+                category_map[categoryid][idx][str(dataname)].append(item_id)
+    return category_map
+
+
+def create_fitb_data(data, dataname, category_map):
+    if dataname == "train":
+        idx = 1
+    elif dataname == "val":
+        idx = 2
+    else:
+        idx = 3
+    fill_in_blank = []
+    for outfit in data:
+        all_items = []
+        categories = []
+        set_id = outfit.get("set_id")
+        for item in outfit.get("items", []):
+            index = item["index"]
+            item_id = f"{set_id}_{index}"
+            all_items.append(item_id)
+            categories.append(item["categoryid"])
+        if len(all_items) < 4:
+            continue
+        blank_idx = random.randint(0, len(all_items)-1)
+        correct = all_items[blank_idx]
+        questions = all_items[:blank_idx] + all_items[blank_idx+1:]
+        correct_category = categories[blank_idx]
+        candidates = category_map[correct_category][idx][str(dataname)]
+        valid_cands = [cand for cand in candidates if cand != correct]
+        if len(valid_cands) < 4:
+            final_cands = valid_cands
+        else:
+            final_cands = random.sample(valid_cands, 3)
+        final_cands.insert(0, correct)
+        fill_in_blank.append(
+            {
+                "question":questions,
+                "answers": final_cands,
+                "blank_position":blank_idx+1
+            }
+        )
+    return fill_in_blank
+
+class OutfitGenerator:
+    def __init__(self, text_embeddings, map_id_img_embed, item_ids, score_model, top_k=1):
+        self.text_embeddings = text_embeddings
+        self.map_id_img_embed = map_id_img_embed
+        self.k = top_k
+        self.model = score_model
+        self.item_ids = item_ids
+
+    def generate_outfit_from_llm(self):
+        # Initialize OpenRouter client
+        client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key="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",
+        )
+        # Ask user for input
+        city = input("which city are you currently in?")
+        occasion = input("What occasion do you need this outfit for?")
+        sex = input("what's your gender")
+
+        # Get temperature
+        API_KEY = "0db13be3f5563366aed5781b81d39c7f"
+        url = f'https://api.openweathermap.org/data/2.5/weather?q={city}&appid={API_KEY}&units=imperial'
+        response_weather = requests.get(url)
+        data = response.json()
+
+        # Build dynamic prompt
+        prompt = f"""You're a fashion stylist. A {sex} user is going to the following occasion: {occasion}.
+        The weather now in {city} is {data['weather'][0]['main']} with a temperature of {data['main']['temp']}°F, 
+        ranging from a low of {data['main']['temp_min']}°F to a high of {data['main']['temp_max']}°F.
+        Based on the weather condition and occasion, suggest no less than 4 distinct fashion/clothing/accessory items they should wear.
+        - Do not include beauty products.
+        - Do not offer alternatives like “or”.
+        - Return only a single line of text.
+        - Format the output as: item1, item2, item3, item4
+        - Do not use bullet points or line breaks.
+        - Do not output anything except just a line of items separate with comma.
+        """
+        # Call OpenRouter model
+        completion = client.chat.completions.create(
+            model="meta-llama/llama-3.1-8b-instruct:free",
+            extra_headers={
+                "HTTP-Referer": "https://yourproject.example",  # optional
+                "X-Title": "FashionRAG",  # optional
+            },
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+        # clean response
+        response_llm = completion.choices[0].message.content
+        item_texts = [item.strip() for item in response_llm.split(',')]
+        print(f"The weather now in {city} is {data['weather'][0]['main']} with a temperature of {data['main']['temp']}°F, ranging from a low of {data['main']['temp_min']}°F to a high of {data['main']['temp_max']}°F.")
+        return item_texts
+    
+    def encode_query_items(self, item_texts):
+        fclip = FashionCLIP("fashion-clip")  # already on CUDA
+        fclip.device = "cuda"
+        return fclip.encode_text(item_texts, batch_size=len(item_texts))
+
+    # Retrieve real catalog items (nearest neighbor search)
+    def retrieve_similar_items(self, item_text_embeds):
+        knn = NearestNeighbors(n_neighbors=self.k, metric='cosine')
+        knn.fit(self.text_embeddings.cpu().numpy())
+        indices = knn.kneighbors(item_text_embeds.cpu().numpy(), return_distance=False)
+        retrieved_ids = [[self.item_ids[i] for i in row] for row in indices]
+        return retrieved_ids
+
+    # Score combinations using your compatibility model
+    def score_outfit(self, retrieved_ids):
+        if not all(x in self.map_id_img_embed for x in retrieved_ids):
+            return -np.inf
+        embeds = torch.stack([self.map_id_img_embed[x] for x in retrieved_ids]).unsqueeze(0).cuda()
+        with torch.no_grad():
+            logit = self.model(embeds) # shape: [1]
+            score = torch.sigmoid(logit).item()  # Now in [0, 1]
+        return score
+
+    # Generate and rerank outfit from prompt
+    def start_generate(self):
+        item_texts = self.generate_outfit_from_llm()
+        item_text_embeds = self.encode_query_items(item_texts)
+        retrieved_ids = self.retrieve_similar_items(torch.tensor(item_text_embeds).cuda())
+        score = self.score_outfit([x[0] if isinstance(x, list) else x for x in retrieved_ids])
+        return f"We recommend you these items: {item_texts}, the corresponding ids are: {retrieved_ids}. This outfit is {score * 100:.1f}% likely to be compatible."
+
+    
+        
