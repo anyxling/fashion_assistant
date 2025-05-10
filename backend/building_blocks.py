@@ -1,3 +1,4 @@
+# buildng_blocks.py
 from fashion_clip.fashion_clip import FashionCLIP
 from PIL import Image
 import json
@@ -21,6 +22,9 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 import hashlib
+
+with open('api_keys.json') as file:
+    keys = json.load(file)
 
 def get_valid_items(all_sets):
     # Filter and collect valid (image_path, description) pairs
@@ -57,7 +61,7 @@ def create_embeds(valid_items, batch_size=1024):
 
     for i in tqdm(range(0, len(valid_items), batch_size)):
         batch = valid_items[i:i + batch_size]
-        image_paths = [img_path for img_path, _ in batch]
+        image_paths = [image_rgb_path for image_rgb_path, _ in batch]
         descriptions = [desc for _, desc in batch]
 
         # Load images
@@ -65,7 +69,7 @@ def create_embeds(valid_items, batch_size=1024):
             images = list(executor.map(load_image, image_paths))
 
         # Filter
-        filtered_batch = [(img, desc, path) for img, desc, path in zip(images, descriptions, image_paths) if img is not None]
+        filtered_batch = [(image_rgb, desc, path) for image_rgb, desc, path in zip(images, descriptions, image_paths) if image_rgb is not None]
         if not filtered_batch:
             continue
 
@@ -76,10 +80,10 @@ def create_embeds(valid_items, batch_size=1024):
         item_ids.extend(ids)
 
         # Embed
-        img_emb = fclip.encode_images(list(images), batch_size=len(images))
+        image_rgb_emb = fclip.encode_images(list(images), batch_size=len(images))
         txt_emb = fclip.encode_text(list(descriptions), batch_size=len(images))
 
-        image_embeddings.append(torch.from_numpy(img_emb))
+        image_embeddings.append(torch.from_numpy(image_rgb_emb))
         text_embeddings.append(torch.from_numpy(txt_emb))
 
     image_embeddings = torch.cat(image_embeddings, dim=0)
@@ -198,9 +202,9 @@ def create_fitb_data(data, dataname, category_map):
     return fill_in_blank
 
 class OutfitGenerator:
-    def __init__(self, text_embeddings, map_id_img_embed, item_ids, score_model, city, occasion, sex, top_k=1):
+    def __init__(self, text_embeddings, map_id_image_rgb_embed, item_ids, score_model, city, occasion, sex, top_k=1):
         self.text_embeddings = text_embeddings
-        self.map_id_img_embed = map_id_img_embed
+        self.map_id_image_rgb_embed = map_id_image_rgb_embed
         self.k = top_k
         self.model = score_model
         self.item_ids = item_ids
@@ -212,7 +216,7 @@ class OutfitGenerator:
         # Initialize OpenRouter client
         client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
-            api_key="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",
+            api_key=keys["llama_outfit"],
         )
         # # Ask user for input
         # city = input("which city are you currently in?")
@@ -220,7 +224,7 @@ class OutfitGenerator:
         # sex = input("what's your gender")
 
         # Get temperature
-        API_KEY = "0db13be3f5563366aed5781b81d39c7f"
+        API_KEY = keys["openweather"]
         url = f'https://api.openweathermap.org/data/2.5/weather?q={self.city}&appid={API_KEY}&units=imperial'
         response_weather = requests.get(url)
         data = response_weather.json()
@@ -269,9 +273,9 @@ class OutfitGenerator:
 
     # Score combinations using your compatibility model
     def score_outfit(self, retrieved_ids):
-        if not all(x in self.map_id_img_embed for x in retrieved_ids):
+        if not all(x in self.map_id_image_rgb_embed for x in retrieved_ids):
             return -np.inf
-        embeds = torch.stack([self.map_id_img_embed[x] for x in retrieved_ids]).unsqueeze(0).cuda()
+        embeds = torch.stack([self.map_id_image_rgb_embed[x] for x in retrieved_ids]).unsqueeze(0).cuda()
         with torch.no_grad():
             logit = self.model(embeds) # shape: [1]
             score = torch.sigmoid(logit).item()  # Now in [0, 1]
@@ -308,13 +312,13 @@ class TransformerScorer(nn.Module):
         return self.scorer(x).squeeze()          # (batch,)
 
 
-def create_caption_for_image(img_path):
-    with open(img_path, "rb") as image_file:
+def create_caption_for_image(image_rgb_path):
+    with open(image_rgb_path, "rb") as image_file:
         image_data = base64.b64encode(image_file.read()).decode('utf-8')
 
     client = OpenAI(
         base_url="https://openrouter.ai/api/v1",
-        api_key="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",
+        api_key=keys["gemini_caption"],
     )
 
     completion = client.chat.completions.create(
@@ -323,8 +327,8 @@ def create_caption_for_image(img_path):
         "X-Title": "<YOUR_SITE_NAME>", # Optional. Site title for rankings on openrouter.ai.
     },
     extra_body={},
-    model="google/gemini-pro-vision",
-    # model="meta-llama/llama-3.2-90b-vision-instruct",
+    # model="google/gemini-pro-vision",
+    model="google/gemini-flash-1.5",
     messages=[
         {
         "role": "user",
@@ -349,33 +353,23 @@ def create_caption_for_image(img_path):
 
 
 def segment_and_paste_on_white(model, image_rgb):
-    # # Load image
-    # image = cv2.imread(image_path)
-    # image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-    if not isinstance(image_rgb, np.ndarray):
-        image_rgb = np.array(image_rgb)
-
-    # Run segmentation
-    results = model(image_rgb)[0]  # get the first result
-    masks = results.masks.data.cpu().numpy()  # shape: (num_instances, H, W)
-
-    if len(masks) == 0:
-        print("No object detected.")
-        return
-
+    image_arr = np.array(image_rgb)
+    results = model(image_arr)[0]
+    if not results.masks:
+        return image_rgb
+    masks = results.masks.data.cpu().numpy()
     # Combine all masks
     combined_mask = np.any(masks, axis=0).astype(np.uint8)
 
     # Resize mask to match original size (optional)
-    combined_mask = cv2.resize(combined_mask, (image_rgb.shape[1], image_rgb.shape[0]))
+    combined_mask = cv2.resize(combined_mask, (results.orig_img.shape[1], results.orig_img.shape[0]))
 
     # Create white background
-    white_bg = np.ones_like(image_rgb, dtype=np.uint8) * 255
+    white_bg = np.ones_like(image_arr, dtype=np.uint8) * 255
 
     # Apply mask
     for c in range(3):  # for each color channel
-        white_bg[:, :, c] = np.where(combined_mask == 1, image_rgb[:, :, c], 255)
+        white_bg[:, :, c] = np.where(combined_mask == 1, results.orig_img[:, :, c], 255)
 
     # Return as PIL Image
     return Image.fromarray(white_bg)
